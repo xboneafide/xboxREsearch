@@ -1,0 +1,4 @@
+#!/bin/sh
+# Pre-commit scrub gate for xbone-deep-analysis.
+# Blocks banned artifacts and unredacted identifier-shaped content.
+python scripts/scrub_check.py || exit 1

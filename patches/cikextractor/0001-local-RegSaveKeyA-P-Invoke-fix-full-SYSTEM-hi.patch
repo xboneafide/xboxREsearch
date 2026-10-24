@@ -1,0 +1,168 @@
+From 614221e92c155e8fd19ffcb3b3a3c5f5db1781a0 Mon Sep 17 00:00:00 2001
+From: researcher <redacted>
+Date: Mon, 28 Sep 2026 13:42:54 -0600
+Subject: [PATCH] local: RegSaveKeyA P/Invoke fix + full SYSTEM hive
+ path fallback
+
+---
+ CikExtractor/CikExtractor.csproj  |   3 +-
+ CikExtractor/RegistryInterface.cs | 111 +++++++++++++++++++++++++++---
+ 2 files changed, 102 insertions(+), 12 deletions(-)
+
+diff --git a/CikExtractor/CikExtractor.csproj b/CikExtractor/CikExtractor.csproj
+index 3d6e98f..6f68943 100644
+--- a/CikExtractor/CikExtractor.csproj
++++ b/CikExtractor/CikExtractor.csproj
+@@ -2,7 +2,8 @@
+ 
+   <PropertyGroup>
+     <OutputType>Exe</OutputType>
+-    <TargetFramework>net10.0</TargetFramework>
++    <TargetFramework>net6.0</TargetFramework>
++    <LangVersion>11</LangVersion>
+     <ImplicitUsings>enable</ImplicitUsings>
+     <Nullable>enable</Nullable>
+   </PropertyGroup>
+diff --git a/CikExtractor/RegistryInterface.cs b/CikExtractor/RegistryInterface.cs
+index 8d69772..5988932 100644
+--- a/CikExtractor/RegistryInterface.cs
++++ b/CikExtractor/RegistryInterface.cs
+@@ -1,4 +1,5 @@
+ ﻿using System.Diagnostics;
++using System.Runtime.InteropServices;
+ using CikExtractor.Models;
+ using Registry;
+ 
+@@ -39,7 +40,11 @@ internal sealed class RegistryManager
+         if (hivePath == null)
+         {
+             hivePath = Path.GetTempFileName();
+-
++            // PATCH (local): RegSaveKeyA CANNOT overwrite an existing file
++            // (upstream relied on `reg save /Y`). GetTempFileName() creates an empty
++            // file at the path — delete it before the export or RegSaveKeyA fails
++            // with ERROR_FILE_EXISTS.
++            File.Delete(hivePath);
+             ExportRegistryHive(ControlRegKey, hivePath);
+         }
+ 
+@@ -59,22 +64,106 @@ internal sealed class RegistryManager
+ 
+     private static void ExportRegistryHive(string hiveName, string outputPath)
+     {
+-        using var process = new Process();
+-        process.StartInfo.Verb = "runas";
+-        process.StartInfo.FileName = RegExe;
+-        process.StartInfo.CreateNoWindow = true;
+-        process.StartInfo.UseShellExecute = true;
+-        process.StartInfo.Arguments = string.Format(ExportCommand, hiveName, outputPath);
+-
+-        process.Start();
+-        process.WaitForExit();
++        // PATCH (local): P/Invoke RegSaveKeyA instead of shelling out to
++        // reg.exe — the Xbox SystemOS may not ship reg.exe, and as SYSTEM we can
++        // acquire SeBackupPrivilege directly. Mirrors the pack's registry_dump.xml
++        // approach (proven on-console via dotnet msbuild).
++        AdjustTokenPrivs();
++
++        var rootMap = new Dictionary<string, UIntPtr>
++        {
++            ["HKEY_LOCAL_MACHINE"] = new UIntPtr(0x80000002u),
++            ["HKLM"] = new UIntPtr(0x80000002u),
++        };
++
++        var parts = hiveName.TrimEnd('\\').Split(new[] { '\\' }, 2);
++        if (!rootMap.TryGetValue(parts[0], out var root))
++            throw new InvalidOperationException($"Unsupported registry root: {parts[0]}");
++
++        var subKey = parts.Length > 1 ? parts[1] : null;
++
++        if (RegOpenKeyEx(root, subKey, 0, 0x0001 | 0x0100, out var hKey) != 0)
++            throw new InvalidOperationException($"Failed to open {hiveName}");
++
++        try
++        {
++            var result = RegSaveKeyA(hKey, outputPath, IntPtr.Zero);
++            if (result != 0)
++                throw new InvalidOperationException($"RegSaveKeyA failed ({result}) for {hiveName} -> {outputPath}");
++        }
++        finally
++        {
++            RegCloseKey(hKey);
++        }
++    }
++
++    // ---- P/Invoke for direct hive export ----
++
++    [DllImport("advapi32.dll", CharSet = CharSet.Ansi, SetLastError = true)]
++    private static extern int RegOpenKeyEx(UIntPtr hKey, string? subKey, int ulOptions, int samDesired, out UIntPtr hkResult);
++
++    [DllImport("advapi32.dll", CharSet = CharSet.Ansi, SetLastError = true)]
++    private static extern int RegSaveKeyA(UIntPtr hKey, string lpFile, IntPtr lpSecurityAttributes);
++
++    [DllImport("advapi32.dll", SetLastError = true)]
++    private static extern int RegCloseKey(UIntPtr hKey);
++
++    [DllImport("advapi32.dll", SetLastError = true)]
++    private static extern int OpenProcessToken(IntPtr ProcessHandle, int DesiredAccess, ref IntPtr TokenHandle);
++
++    [DllImport("advapi32.dll", SetLastError = true)]
++    private static extern int AdjustTokenPrivileges(IntPtr TokenHandle, bool DisableAllPrivileges, ref TOKEN_PRIVILEGES NewState, uint BufferLength, IntPtr PreviousState, IntPtr ReturnLength);
++
++    [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Ansi)]
++    private static extern int LookupPrivilegeValue(string? lpSystemName, string lpName, ref LUID lpLuid);
++
++    [DllImport("kernelbase.dll", SetLastError = true)]
++    private static extern IntPtr GetCurrentProcess();
++
++    [DllImport("kernelbase.dll", SetLastError = true)]
++    private static extern bool CloseHandle(IntPtr hObject);
++
++    [StructLayout(LayoutKind.Sequential)]
++    private struct LUID { public uint LowPart; public int HighPart; }
++
++    [StructLayout(LayoutKind.Sequential)]
++    private struct TOKEN_PRIVILEGES { public uint PrivilegeCount; public LUID Luid; public uint Attributes; }
++
++    private static void AdjustTokenPrivs()
++    {
++        const int TOKEN_ADJUST_PRIVILEGES = 0x00000020;
++        const int SE_PRIVILEGE_ENABLED = 0x00000002;
++        const int TOKEN_QUERY = 0x00000008;
++
++        var luid = new LUID();
++        var tp = new TOKEN_PRIVILEGES { PrivilegeCount = 1, Attributes = SE_PRIVILEGE_ENABLED };
++        var tp2 = new TOKEN_PRIVILEGES { PrivilegeCount = 1, Attributes = SE_PRIVILEGE_ENABLED };
++
++        IntPtr token = IntPtr.Zero;
++        _ = OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, ref token);
++        _ = LookupPrivilegeValue(null, "SeBackupPrivilege", ref luid);
++        tp.Luid = luid;
++        tp2.Luid = luid;
++        _ = AdjustTokenPrivileges(token, false, ref tp, 0, IntPtr.Zero, IntPtr.Zero);
+     }
+ 
+     private List<SpLicense> ParseLicenses()
+     {
+         Debug.Assert(_loadedRegistry != null, "_loadedRegistry != null");
+ 
+-        var licenseBlobValues = _loadedRegistry.GetKey(LicenseBlobStorage).Values;
++        // PATCH (local): the hive given via -r may be either the Control
++        // subtree (as exported by export-hive / dump on-device) OR a full SYSTEM
++        // hive (as exported by the pack's option-4 Regdump, which RegSaveKeyA's
++        // the whole SYSTEM key). Try the direct path first, then the full-hive
++        // path with the ControlSet001\Control prefix.
++        var key = _loadedRegistry.GetKey(LicenseBlobStorage);
++        var licenseBlobValues = key != null
++            ? key.Values
++            : _loadedRegistry
++                .GetKey("ControlSet001\\Control\\" + LicenseBlobStorage)
++                ?.Values
++            ?? new List<Registry.Abstractions.KeyValue>();
++
+         return licenseBlobValues
+             .Where(value => value.ValueDataRaw.Length > 8)
+             .Select(licenseBlobValue => licenseBlobValue.ValueDataRaw)
+-- 
+2.53.0.windows.3
+

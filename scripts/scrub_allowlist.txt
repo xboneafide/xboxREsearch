@@ -1,0 +1,13 @@
+# Literal strings exempt from the identifier scan because they are format
+# constants identical on every console (registry storage GUIDs), not
+# device/account identifiers.
+7746D80F-97E0-4E26-9543-26B41FC22F79
+A25AE4F2-1B96-4CED-8007-AA30E9B1A218
+# Upstream repository commit SHAs used as patch provenance in patches/ —
+# public upstream identifiers, not local secrets.
+580ed7ddbe625f464e165736a37e8a2e9f16a7f0
+6aa2420f8f0d5e6f7460ff13f399037583a942f4
+# Microsoft-hosted OSU1 package URLs: the GUID path component is a public
+# package constant (same for every console/user), not a device identifier.
+# Only exempts lines containing the download.microsoft.com path prefix.
+download.microsoft.com/download/

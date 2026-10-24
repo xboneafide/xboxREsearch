@@ -1,0 +1,15 @@
+diff --git a/examples/src/lib.rs b/examples/src/lib.rs
+index 0ed9dcd..9da35b2 100644
+--- a/examples/src/lib.rs
++++ b/examples/src/lib.rs
+@@ -61,7 +61,9 @@ pub async fn auth_main_default(
+ ) -> Result<TokenStore, Error> {
+     auth_main(
+         XalAppParameters::default(),
+-        XalClientParameters::default(),
++        // PATCH(local): explicit Win32/GRTS client identity (the trait
++        // Default patch didn't propagate to the example binary).
++        xal::client_params::CLIENT_WINDOWS(),
+         "RETAIL".to_owned(),
+         access_token_prefix,
+         auth_cb,

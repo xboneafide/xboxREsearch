@@ -1,0 +1,127 @@
+From b8ea23edce4e4e913655488e4a814f1d4b337e7d Mon Sep 17 00:00:00 2001
+From: researcher <redacted>
+Date: Mon, 28 Sep 2026 13:42:59 -0600
+Subject: [PATCH 1/4] local: sisu device_token/sandbox Option; redirect
+ full base match
+
+---
+ examples/src/bin/auth_webview.rs | 61 ++++++++++++++++++--------------
+ src/models.rs                    |  9 +++--
+ 2 files changed, 42 insertions(+), 28 deletions(-)
+
+diff --git a/examples/src/bin/auth_webview.rs b/examples/src/bin/auth_webview.rs
+index 7f4f2de..158ab2f 100644
+--- a/examples/src/bin/auth_webview.rs
++++ b/examples/src/bin/auth_webview.rs
+@@ -24,7 +24,7 @@ enum UserEvent {
+ }
+ 
+ struct WebviewCallbackHandler {
+-    redirect_url_schema: String,
++    redirect_url_base: String,
+ }
+ 
+ #[async_trait]
+@@ -36,24 +36,27 @@ impl AuthPromptCallback for WebviewCallbackHandler {
+         let authentication_url = cb_data.authentication_url();
+         let does_expect_url = cb_data.expect_url();
+ 
+-        let redirect_url_schema = self.redirect_url_schema.clone();
+-
+-        let mut event_loop = EventLoopBuilder::with_user_event().build();
+-        let event_proxy = event_loop.create_proxy();
+-        let window = WindowBuilder::new()
+-            .with_title("XAL Webview")
+-            .build(&event_loop)
+-            .unwrap();
+-
+-        let (sender, mut receiver) = channel::<Url>(1);
+-
+-        let _webview = WebViewBuilder::new(window)?
+-            // tell the webview to load the custom protocol
+-            .with_navigation_handler(move |url| {
+-                if does_expect_url {
+-                    // Callback wants a redirect URL (with either authorization code or implicit tokens)
+-                    let parsed_url = Url::parse(&url).expect("Failed to parse navigation URL");
+-                    if parsed_url.scheme() == redirect_url_schema {
++        let redirect_url_base = self.redirect_url_base.clone();
++
++    let mut event_loop = EventLoopBuilder::with_user_event().build();
++            let event_proxy = event_loop.create_proxy();
++            let window = WindowBuilder::new()
++                .with_title("XAL Webview")
++                .build(&event_loop)
++                .unwrap();
++
++            let (sender, mut receiver) = channel::<Url>(1);
++
++            let _webview = WebViewBuilder::new(window)?
++                // tell the webview to load the custom protocol
++                .with_navigation_handler(move |url| {
++                    if does_expect_url {
++                        // Callback wants a redirect URL (with either authorization code or implicit tokens)
++                        let parsed_url = Url::parse(&url).expect("Failed to parse navigation URL");
++                        // Match the full redirect base (scheme + host + path), not just the scheme.
++                        // With https://login.live.com/oauth20_desktop.srf as redirect, a pure scheme
++                        // check matches the login URL itself and breaks the flow.
++                        if parsed_url.as_str().starts_with(&redirect_url_base) {
+                         sender
+                             .try_send(parsed_url)
+                             .expect("Failed to send redirect URL over channel");
+@@ -100,13 +103,19 @@ async fn main() -> Result<(), Error> {
+     let authenticator = XalAuthenticator::default();
+ 
+     let callback_handler = WebviewCallbackHandler {
+-        redirect_url_schema: authenticator
+-            .get_redirect_uri()
+-            .ok_or(Error::GeneralError(
+-                "Failure! Authenticator not configured with redirect URL".to_string(),
+-            ))?
+-            .scheme()
+-            .to_owned(),
++        redirect_url_base: {
++            let uri = authenticator
++                .get_redirect_uri()
++                .ok_or(Error::GeneralError(
++                    "Failure! Authenticator not configured with redirect URL".to_string(),
++                ))?;
++            format!(
++                "{}://{}{}",
++                uri.scheme(),
++                uri.host_str().unwrap_or(""),
++                uri.path()
++            )
++        },
+     };
+ 
+     auth_main_default(AccessTokenPrefix::None, callback_handler).await?;
+diff --git a/src/models.rs b/src/models.rs
+index 10df750..35c0763 100644
+--- a/src/models.rs
++++ b/src/models.rs
+@@ -396,7 +396,10 @@ pub mod response {
+     #[serde(rename_all = "PascalCase")]
+     pub struct SisuAuthorizationResponse {
+         /// Device Token
+-        pub device_token: String,
++        /// NOTE: field is optional — the retail sisu /authorize endpoint omits it
++        /// when the device token was already issued at the /authenticate step.
++        #[serde(default)]
++        pub device_token: Option<String>,
+         /// Title Token
+         pub title_token: TitleToken,
+         /// User Token
+@@ -406,7 +409,9 @@ pub mod response {
+         /// Web page
+         pub web_page: String,
+         /// Xbox Live sandbox
+-        pub sandbox: String,
++        /// NOTE: retail sisu /authorize omits this field too — make it optional.
++        #[serde(default)]
++        pub sandbox: Option<String>,
+         /// Modern gamertag indication
+         pub use_modern_gamertag: Option<bool>,
+     }
+-- 
+2.53.0.windows.3
+

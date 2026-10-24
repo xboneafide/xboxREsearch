@@ -1,0 +1,118 @@
+From 173247bc93086df6a386fd946bc0f8d5f4df09a9 Mon Sep 17 00:00:00 2001
+From: researcher <redacted>
+Date: Thu, 22 Oct 2026 07:35:52 -0600
+Subject: [PATCH 2/4] ach_pull: XBL v4 achievement pull bin (scid path 405s;
+ titleId query route is the working form)
+
+---
+ examples/Cargo.toml          |  6 ++-
+ examples/src/bin/ach_pull.rs | 82 ++++++++++++++++++++++++++++++++++++
+ 2 files changed, 87 insertions(+), 1 deletion(-)
+ create mode 100644 examples/src/bin/ach_pull.rs
+
+diff --git a/examples/Cargo.toml b/examples/Cargo.toml
+index b66d6c7..dcdb78c 100644
+--- a/examples/Cargo.toml
++++ b/examples/Cargo.toml
+@@ -43,4 +43,8 @@ name = "xbl_signed_request"
+ 
+ [[bin]]         
+ name = "auth_webview"
+-required-features = ["webview"]
+\ No newline at end of file
++required-features = ["webview"]
++
++[[bin]]
++name = "ach_pull"
++
+diff --git a/examples/src/bin/ach_pull.rs b/examples/src/bin/ach_pull.rs
+new file mode 100644
+index 0000000..f6bbcec
+--- /dev/null
++++ b/examples/src/bin/ach_pull.rs
+@@ -0,0 +1,82 @@
++//! Pull full XBL achievement lists (v4) for a set of SCIDs, with request signing.
++//! Usage: ach_pull.exe <scid1> <scid2> ...   (reads tokens.json next to CWD)
++use xal::{
++    cvlib::CorrelationVector,
++    extensions::{
++        CorrelationVectorReqwestBuilder, LoggingReqwestRequestHandler,
++        LoggingReqwestResponseHandler, SigningReqwestBuilder,
++    },
++    Error, RequestSigner, TokenStore,
++};
++use std::env;
++
++#[tokio::main]
++async fn main() -> Result<(), Box<dyn std::error::Error>> {
++    let token_store = TokenStore::load_from_file("tokens.json")?;
++    let xsts_token = token_store
++        .authorization_token
++        .ok_or(Error::GeneralError("No XSTS token was acquired".into()))?;
++    xsts_token.check_validity()?;
++    let auth_header = xsts_token.authorization_header_value();
++
++    let client = reqwest::Client::new();
++    for scid in env::args().skip(1) {
++        let mut out_items: Vec<serde_json::Value> = Vec::new();
++        let mut cont: Option<String> = None;
++        loop {
++            let mut url = format!(
++                "https://achievements.xboxlive.com/users/xuid({})/achievements/{}?orderBy=UnlockTime",
++                /* redacted account id, same length */ "XXXXXXXXXXXXXXXX", scid
++            );
++            if let Some(c) = &cont {
++                url.push_str(&format!("&continuationToken={}", urlquery::encode(c)));
++            }
++            let mut cv = CorrelationVector::new();
++            let mut signer = RequestSigner::new();
++            let resp = client
++                .get(&url)
++                .header("x-xbl-contract-version", "4")
++                .header("Accept-Language", "en-US")
++                .header("Authorization", &auth_header)
++                .add_cv(&mut cv)?
++                .sign(&mut signer, None)
++                .await?
++                .log()
++                .await?
++                .send()
++                .await?;
++            let status = resp.status();
++            let body = resp.text().await?;
++            if !status.is_success() {
++                eprintln!("HTTP {} for {}", status, url);
++                break;
++            }
++            let v: serde_json::Value = serde_json::from_str(&body)?;
++            let items = v["achievements"].as_array().cloned().unwrap_or_default();
++            let n = items.len();
++            out_items.extend(items);
++            cont = v["paging"]["continuationToken"].as_str().map(|s| s.to_string());
++            eprintln!("  {} items (total {}), cont={}", n, out_items.len(), cont.is_some());
++            if cont.is_none() || n == 0 {
++                break;
++            }
++        }
++        let fname = format!("ach-{}.json", scid);
++        std::fs::write(&fname, serde_json::to_vec_pretty(&out_items)?)?;
++        println!("{} -> {} achievements -> {}", scid, out_items.len(), fname);
++    }
++    Ok(())
++}
++
++mod urlquery {
++    pub fn encode(s: &str) -> String {
++        let mut out = String::new();
++        for b in s.bytes() {
++            match b {
++                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => out.push(b as char),
++                other => out.push_str(&format!("%{:02X}", other)),
++            }
++        }
++        out
++    }
++}
+-- 
+2.53.0.windows.3
+
